@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from enum import Enum, auto
 from uuid import uuid4
-
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -10,20 +9,31 @@ import json
 from fastapi import Query
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-import hashlib, uuid, asyncio
+import hashlib
+import uuid
+import asyncio
+
+
+# ====== MPC Commitment Round ======
 
 @dataclass
 class RollRound:
+    """
+    Представляет один раунд совместной генерации случайного числа (MPC).
+    Сервер координирует обмен коммитментами и раскрытиями, но не знает результат до reveal.
+    """
     id: str
-    n: int
-    participants: List[str]
-    commits: Dict[str, str] = field(default_factory=dict)   # user_id -> c
-    reveals: Dict[str, int] = field(default_factory=dict)   # user_id -> a
-    phase: str = "COMMIT"                                   # COMMIT/REVEAL/DONE
+    n: int  # диапазон [0, n-1]
+    participants: List[str]  # user_id участников
+    commits: Dict[str, str] = field(default_factory=dict)  # user_id -> commitment c_j
+    reveals: Dict[str, int] = field(default_factory=dict)  # user_id -> revealed value a_j
+    phase: str = "COMMIT"  # COMMIT -> REVEAL -> DONE
 
-# ====== Доменные модели ======
+
+# ====== Domain Models ======
 
 class PlayerGameStatus(Enum):
+    """Статус игрока в игре (на сервере отслеживается только pass/bust, не счетчик)"""
     ACTIVE = auto()
     PASSED = auto()
     BUSTED = auto()
@@ -34,19 +44,15 @@ class User:
     id: str
     name: str
 
-@dataclass
-class Game:
-    id: str
-    n: int
-    m: int
-    phase: str  # например "IN_PROGRESS"
-    # + players/current_player_id и т.д.
 
 @dataclass
 class PlayerInGame:
+    """
+    Игрок в игре.
+    ВАЖНО: счетчик x_i хранится ТОЛЬКО на клиенте, сервер не знает его значения!
+    """
     user: User
     status: PlayerGameStatus = PlayerGameStatus.ACTIVE
-    # приватный счётчик x_i игрок ведёт у себя на клиенте
 
 
 class GamePhase(Enum):
@@ -57,63 +63,89 @@ class GamePhase(Enum):
 
 @dataclass
 class GameState:
+    """Состояние игры на сервере (публичная информация)"""
     id: str
-    n: int
-    m: int
+    n: int  # размер кубика
+    m: int  # порог проигрыша
     players: List[PlayerInGame] = field(default_factory=list)
     phase: GamePhase = GamePhase.WAITING_FOR_PLAYERS
-    current_turn_index: int = 0  # индекс в списке players
+    current_turn_index: int = 0
 
     def current_player(self) -> Optional[PlayerInGame]:
-        if not self.players:
-            return None
-        if self.current_turn_index < 0 or self.current_turn_index >= len(self.players):
+        """Возвращает игрока, чей сейчас ход"""
+        if not self.players or self.current_turn_index >= len(self.players):
             return None
         return self.players[self.current_turn_index]
 
     def advance_turn(self) -> None:
+        """Переход к следующему активному игроку"""
         if not self.players:
             return
-        self.current_turn_index = (self.current_turn_index + 1) % len(self.players)
+
+        # Ищем следующего активного игрока
+        for _ in range(len(self.players)):
+            self.current_turn_index = (self.current_turn_index + 1) % len(self.players)
+            current = self.current_player()
+            if current and current.status == PlayerGameStatus.ACTIVE:
+                return
+
+        # Если не нашли активных игроков, игра окончена
+        self.phase = GamePhase.FINISHED
 
     def mark_pass(self, user_id: str) -> None:
+        """Помечает игрока как спасовавшего"""
         for p in self.players:
             if p.user.id == user_id:
                 p.status = PlayerGameStatus.PASSED
+                return
 
     def mark_busted(self, user_id: str) -> None:
+        """Помечает игрока как проигравшего (вылетевшего)"""
         for p in self.players:
             if p.user.id == user_id:
                 p.status = PlayerGameStatus.BUSTED
+                return
 
-    def is_everyone_done(self) -> bool:
-        return all(p.status != PlayerGameStatus.ACTIVE for p in self.players)
+    def is_game_over(self) -> bool:
+        """Игра окончена, если активных игроков <= 1"""
+        active_count = sum(1 for p in self.players if p.status == PlayerGameStatus.ACTIVE)
+        return active_count <= 1
+
+    def get_winner(self) -> Optional[str]:
+        """
+        Возвращает ID победителя.
+        Победитель = последний активный или последний спасовавший игрок.
+        Сервер не знает счетчики x_i, поэтому клиенты сами определяют победителя.
+        """
+        active = [p for p in self.players if p.status == PlayerGameStatus.ACTIVE]
+        if len(active) == 1:
+            return active[0].user.id
+
+        passed = [p for p in self.players if p.status == PlayerGameStatus.PASSED]
+        if passed:
+            # Если все активные вылетели, побеждает последний спасовавший
+            # (логика может быть доработана на клиенте)
+            return passed[-1].user.id
+
+        return None
 
 
 @dataclass
 class Room:
+    """Комната с игроками и игрой"""
     id: str
     name: str
-
-    # Пользователи в комнате (то, что ты уже используешь)
     users: Dict[str, User] = field(default_factory=dict)
-
-    # Текущая игра (или None, если игра ещё не создана)
-    game: Optional[Game] = None
+    game: Optional[GameState] = None
     is_active: bool = False
-
-    # WebSocket соединения: user_id -> WebSocket
     websockets: Dict[str, WebSocket] = field(default_factory=dict)
 
-    # --- MPC state ---
+    # MPC state
     current_round: Optional[RollRound] = None
-
-    # Lock для защиты current_round/commits/reveals от гонок
     round_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-
-# ====== Stores (как раньше, только Room расширен) ======
+# ====== Stores ======
 
 class InMemoryUserStore:
     def __init__(self) -> None:
@@ -134,9 +166,8 @@ class InMemoryUserStore:
 
     def delete_user(self, user_id: str) -> None:
         user = self._users_by_id.pop(user_id, None)
-        if user is None:
-            return
-        self._users_by_name.pop(user.name, None)
+        if user:
+            self._users_by_name.pop(user.name, None)
 
     def all_users(self) -> List[User]:
         return list(self._users_by_id.values())
@@ -215,8 +246,8 @@ class RoomService:
         if room is None:
             raise HTTPException(status_code=404, detail="Room not found")
 
-        if not room.users:
-            raise HTTPException(status_code=400, detail="Cannot start game without players")
+        if len(room.users) < 2:
+            raise HTTPException(status_code=400, detail="Need at least 2 players to start")
 
         if room.game is not None and room.game.phase == GamePhase.IN_PROGRESS:
             raise HTTPException(status_code=400, detail="Game already in progress")
@@ -227,6 +258,7 @@ class RoomService:
         room.game = game
         room.is_active = True
         return game
+
 
 # ====== DTO / Schemas ======
 
@@ -264,8 +296,13 @@ class GamePublicState(BaseModel):
     phase: str
     players: List[str]
     current_player_id: Optional[str]
+    n: int
+    m: int
 
-app = FastAPI(title="MPC Dice Game Backend (ephemeral users)")
+
+# ====== FastAPI App ======
+
+app = FastAPI(title="MPC Dice Game Backend (Non-Trusted Server)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -281,16 +318,19 @@ user_service = UserService(user_store=user_store)
 room_service = RoomService(room_store=room_store, user_store=user_store)
 
 
+# ====== REST Endpoints ======
+
 @app.post("/users", response_model=UserResponse)
 def register_user(payload: UserCreateRequest) -> UserResponse:
+    """Регистрация пользователя (эфемерного)"""
     user = user_service.register(name=payload.name)
     return UserResponse(id=user.id, name=user.name)
 
 
 @app.post("/rooms", response_model=RoomResponse)
 def create_room(payload: RoomCreateRequest) -> RoomResponse:
+    """Создание комнаты"""
     room = room_service.create_room(name=payload.name)
-
     return RoomResponse(
         id=room.id,
         name=room.name,
@@ -298,12 +338,10 @@ def create_room(payload: RoomCreateRequest) -> RoomResponse:
         is_active=room.is_active,
     )
 
-@app.get("/rooms", response_model=list[RoomResponse])
-def list_rooms() -> list[RoomResponse]:
-    """
-    Вернуть список всех комнат.
-    Используется фронтендом для отображения лобби.
-    """
+
+@app.get("/rooms", response_model=List[RoomResponse])
+def list_rooms() -> List[RoomResponse]:
+    """Список всех комнат"""
     rooms = room_store.all_rooms()
     return [
         RoomResponse(
@@ -318,6 +356,7 @@ def list_rooms() -> list[RoomResponse]:
 
 @app.post("/rooms/{room_id}/join", response_model=RoomResponse)
 def join_room(room_id: str, payload: JoinRoomRequest) -> RoomResponse:
+    """Присоединение к комнате"""
     room = room_service.join_room(room_id=room_id, user_id=payload.user_id)
     return RoomResponse(
         id=room.id,
@@ -329,6 +368,7 @@ def join_room(room_id: str, payload: JoinRoomRequest) -> RoomResponse:
 
 @app.post("/rooms/{room_id}/start", response_model=GamePublicState)
 def start_game(room_id: str, payload: StartGameRequest) -> GamePublicState:
+    """Старт игры"""
     game = room_service.start_game(room_id=room_id, n=payload.n, m=payload.m)
     current = game.current_player()
     return GamePublicState(
@@ -336,243 +376,336 @@ def start_game(room_id: str, payload: StartGameRequest) -> GamePublicState:
         phase=game.phase.name,
         players=[p.user.id for p in game.players],
         current_player_id=current.user.id if current else None,
+        n=game.n,
+        m=game.m,
     )
 
+
+# ====== WebSocket Helpers ======
+
 async def broadcast_to_room(room: Room, message: dict) -> None:
+    """Рассылка сообщения всем в комнате"""
     text = json.dumps(message)
-    dead: list[str] = []
+    dead: List[str] = []
     for uid, ws in room.websockets.items():
         try:
             await ws.send_text(text)
         except Exception:
             dead.append(uid)
+
+    # Удаляем мертвые соединения
     for uid in dead:
         room.websockets.pop(uid, None)
-
 
 
 @app.websocket("/ws/rooms/{room_id}")
 async def ws_room(websocket: WebSocket, room_id: str, user_id: str = Query(...)) -> None:
     """
-    Подключение к комнате по WebSocket.
-    user_id — это id, полученный при /users (регистрация по имени).
+    WebSocket подключение к комнате.
+    Сервер координирует MPC протокол, но не вычисляет результаты ходов.
     """
     room = room_store.get_room(room_id)
     if room is None:
-        await websocket.close(code=4404)
+        await websocket.close(code=1008, reason="Room not found")
         return
 
     user = user_store.get_user(user_id)
     if user is None:
-        await websocket.close(code=4401)
+        await websocket.close(code=1008, reason="User not found")
         return
 
     await websocket.accept()
-    await websocket.send_text(json.dumps({
+    room.websockets[user_id] = websocket
+
+    print(f"✅ User {user.name} connected to room {room.name}")
+
+    # Отправляем текущее состояние комнаты новому подключению
+    await websocket.send_json({
         "type": "room_state",
         "room": {
             "id": room.id,
             "name": room.name,
             "users": [{"id": u.id, "name": u.name} for u in room.users.values()],
-            "is_active": room.is_active,
         },
-        "game": None if room.game is None else {
+        "game": {
             "id": room.game.id,
             "phase": room.game.phase.name,
-            "players": [p.user.id for p in room.game.players],
+            "players": [
+                {
+                    "id": p.user.id,
+                    "name": p.user.name,
+                    "status": p.status.name
+                }
+                for p in room.game.players
+            ],
             "current_player_id": room.game.current_player().user.id if room.game.current_player() else None,
             "n": room.game.n,
             "m": room.game.m,
-        }
-    }))
+        } if room.game else None
+    })
 
-    room.websockets[user_id] = websocket
-
-    # уведомляем остальных
+    # Уведомляем других о новом игроке
     await broadcast_to_room(room, {
         "type": "player_joined",
         "user_id": user_id,
-        "name": user.name,
+        "name": user.name
     })
 
     try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"type": "error", "reason": "invalid_json"}))
-                continue
+        async for data in websocket.iter_json():
+            msg_type = data.get("type")
+            print(f"📩 Message from {user.name}: {msg_type}")
 
-            msg_type = msg.get("type")
-
-            # запрос на "roll" (дальше клиент уже делает MPC: commit/reveal по WS или отдельно)
+            # ===== ROLL REQUEST =====
             if msg_type == "roll_request":
-                await handle_roll_request(room=room, user_id=user_id)
+                game = room.game
+                if not game or game.phase != GamePhase.IN_PROGRESS:
+                    await websocket.send_json({"type": "error", "reason": "No active game"})
+                    continue
 
+                current = game.current_player()
+                if not current or current.user.id != user_id:
+                    await websocket.send_json({"type": "error", "reason": "Not your turn"})
+                    continue
+
+                if current.status != PlayerGameStatus.ACTIVE:
+                    await websocket.send_json({"type": "error", "reason": "You are not active"})
+                    continue
+
+                # Запускаем MPC раунд для броска
+                async with room.round_lock:
+                    round_id = str(uuid4())
+                    participants = [p.user.id for p in game.players if p.status == PlayerGameStatus.ACTIVE]
+
+                    roll_round = RollRound(
+                        id=round_id,
+                        n=game.n,
+                        participants=participants
+                    )
+                    room.current_round = roll_round
+
+                    print(f"🎲 Starting MPC round {round_id} with participants: {participants}")
+
+                    # Отправляем commit_phase_start всем активным игрокам
+                    await broadcast_to_room(room, {
+                        "type": "commit_phase_start",
+                        "round_id": round_id,
+                        "n": game.n,
+                        "participants": participants
+                    })
+
+            # ===== COMMIT =====
             elif msg_type == "commit":
-                await handle_commit(room=room, user_id=user_id, round_id=msg.get("round_id"), c=msg.get("c"))
+                round_id = data.get("round_id")
+                commit = data.get("c")
 
+                if not room.current_round or room.current_round.id != round_id:
+                    await websocket.send_json({"type": "error", "reason": "Invalid round"})
+                    continue
+
+                if room.current_round.phase != "COMMIT":
+                    await websocket.send_json({"type": "error", "reason": "Not in commit phase"})
+                    continue
+
+                room.current_round.commits[user_id] = commit
+                print(f"🔒 Commit from {user.name}: {commit[:16]}...")
+
+                # Проверяем, все ли отправили коммитменты
+                if len(room.current_round.commits) == len(room.current_round.participants):
+                    room.current_round.phase = "REVEAL"
+                    print(f"🔓 All commits received, starting reveal phase")
+
+                    await broadcast_to_room(room, {
+                        "type": "reveal_phase_start",
+                        "round_id": round_id
+                    })
+
+            # ===== REVEAL =====
             elif msg_type == "reveal":
-                await handle_reveal(room=room, user_id=user_id, round_id=msg.get("round_id"),
-                                    a=msg.get("a"), salt=msg.get("salt"))
+                round_id = data.get("round_id")
+                a = data.get("a")
+                salt = data.get("salt")
 
-            elif msg_type == "roll_result":
-                busted = bool(msg.get("busted", False))
-                await handle_roll_result(room=room, user_id=user_id, busted=busted)
+                if not room.current_round or room.current_round.id != round_id:
+                    await websocket.send_json({"type": "error", "reason": "Invalid round"})
+                    continue
 
+                if room.current_round.phase != "REVEAL":
+                    await websocket.send_json({"type": "error", "reason": "Not in reveal phase"})
+                    continue
+
+                # Проверяем коммитмент
+                expected_commit = hashlib.sha256(f"{a}|{salt}".encode("utf-8")).hexdigest()
+                actual_commit = room.current_round.commits.get(user_id)
+
+                if expected_commit != actual_commit:
+                    await websocket.send_json({
+                        "type": "error",
+                        "reason": "Commitment verification failed",
+                        "detail": f"Expected {expected_commit[:16]}..., got {actual_commit[:16] if actual_commit else 'None'}..."
+                    })
+                    continue
+
+                room.current_round.reveals[user_id] = a
+                print(f"🔓 Reveal from {user.name}: a={a}")
+
+                # Проверяем, все ли раскрыли значения
+                if len(room.current_round.reveals) == len(room.current_round.participants):
+                    # Вычисляем результат
+                    result = sum(room.current_round.reveals.values()) % room.current_round.n
+                    print(f"🎲 Roll result: {result}")
+
+                    room.current_round.phase = "DONE"
+
+                    # Отправляем результат броска ВСЕМ игрокам
+                    await broadcast_to_room(room, {
+                        "type": "roll_computed",
+                        "round_id": round_id,
+                        "result": result
+                    })
+
+                    # Очищаем раунд
+                    room.current_round = None
+
+            # ===== ROLL SUCCESS =====
+            elif msg_type == "roll_success":
+                game = room.game
+                if not game:
+                    await websocket.send_json({"type": "error", "reason": "No active game"})
+                    continue
+
+                current = game.current_player()
+                if not current or current.user.id != user_id:
+                    await websocket.send_json({"type": "error", "reason": "Not your turn"})
+                    continue
+
+                print(f"✅ {user.name} successfully rolled and didn't bust")
+
+                # Передаем ход следующему игроку
+                game.advance_turn()
+
+                if game.is_game_over():
+                    winner_id = game.get_winner()
+                    game.phase = GamePhase.FINISHED
+                    print(f"🏁 Game over! Winner: {winner_id}")
+
+                    await broadcast_to_room(room, {
+                        "type": "game_finished",
+                        "winner_id": winner_id
+                    })
+                else:
+                    next_player = game.current_player()
+                    if next_player:
+                        print(f"➡️ Next turn: {next_player.user.name}")
+                        await broadcast_to_room(room, {
+                            "type": "next_turn",
+                            "user_id": next_player.user.id,
+                            "player_name": next_player.user.name
+                        })
+
+            # ===== DECLARE BUSTED =====
+            elif msg_type == "declare_busted":
+                game = room.game
+                if not game:
+                    await websocket.send_json({"type": "error", "reason": "No active game"})
+                    continue
+
+                current = game.current_player()
+                if not current or current.user.id != user_id:
+                    await websocket.send_json({"type": "error", "reason": "Not your turn"})
+                    continue
+
+                # Помечаем игрока как проигравшего
+                game.mark_busted(user_id)
+                print(f"💥 {user.name} busted!")
+
+                await broadcast_to_room(room, {
+                    "type": "player_busted",
+                    "user_id": user_id
+                })
+
+                # Передаем ход следующему игроку
+                game.advance_turn()
+
+                if game.is_game_over():
+                    winner_id = game.get_winner()
+                    game.phase = GamePhase.FINISHED
+                    print(f"🏁 Game over! Winner: {winner_id}")
+
+                    await broadcast_to_room(room, {
+                        "type": "game_finished",
+                        "winner_id": winner_id
+                    })
+                else:
+                    next_player = game.current_player()
+                    if next_player:
+                        print(f"➡️ Next turn: {next_player.user.name}")
+                        await broadcast_to_room(room, {
+                            "type": "next_turn",
+                            "user_id": next_player.user.id,
+                            "player_name": next_player.user.name
+                        })
+
+            # ===== PASS =====
             elif msg_type == "pass":
-                await handle_pass(room=room, user_id=user_id)
+                game = room.game
+                if not game:
+                    await websocket.send_json({"type": "error", "reason": "No active game"})
+                    continue
 
+                current = game.current_player()
+                if not current or current.user.id != user_id:
+                    await websocket.send_json({"type": "error", "reason": "Not your turn"})
+                    continue
+
+                game.mark_pass(user_id)
+                print(f"🛑 {user.name} passed")
+
+                await broadcast_to_room(room, {
+                    "type": "player_passed",
+                    "user_id": user_id
+                })
+
+                # Передаем ход следующему игроку
+                game.advance_turn()
+
+                if game.is_game_over():
+                    winner_id = game.get_winner()
+                    game.phase = GamePhase.FINISHED
+                    print(f"🏁 Game over! Winner: {winner_id}")
+
+                    await broadcast_to_room(room, {
+                        "type": "game_finished",
+                        "winner_id": winner_id
+                    })
+                else:
+                    next_player = game.current_player()
+                    if next_player:
+                        print(f"➡️ Next turn: {next_player.user.name}")
+                        await broadcast_to_room(room, {
+                            "type": "next_turn",
+                            "user_id": next_player.user.id,
+                            "player_name": next_player.user.name
+                        })
+
+            # ===== UNKNOWN MESSAGE TYPE =====
             else:
-                await websocket.send_text(json.dumps({"type": "error", "reason": "unknown_type"}))
+                print(f"⚠️ Unknown message type: {msg_type}")
+                await websocket.send_json({
+                    "type": "error",
+                    "reason": f"unknown_message_type",
+                    "detail": f"Message type '{msg_type}' is not recognized"
+                })
 
     except WebSocketDisconnect:
+        print(f"👋 User {user.name} disconnected")
+    except Exception as e:
+        print(f"❌ WebSocket error for {user.name}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
         room.websockets.pop(user_id, None)
         await broadcast_to_room(room, {
             "type": "player_left",
-            "user_id": user_id,
+            "user_id": user_id
         })
-
-async def handle_roll_request(room: Room, user_id: str) -> None:
-    game = room.game
-    if game is None or game.phase != GamePhase.IN_PROGRESS:
-        return
-
-    current = game.current_player()
-    if current is None or current.user.id != user_id:
-        # не его ход
-        ws = room.websockets.get(user_id)
-        if ws:
-            await ws.send_text(json.dumps({"type": "error", "reason": "not_your_turn"}))
-        return
-
-    # уведомляем всех, что игрок начинает ход (клиенты сами запустят MPC commit/reveal)
-    await broadcast_to_room(room, {
-        "type": "turn_started",
-        "user_id": user_id,
-        "n": game.n,
-        "m": game.m,
-    })
-
-    # дальше фронтенд делает MPC и ПОСЛЕ этого шлёт серверу результат:
-    # например, msg type="roll_result" с флагом busted.
-    # Здесь ставим заглушку.
-
-
-async def handle_pass(room: Room, user_id: str) -> None:
-    game = room.game
-    if game is None or game.phase != GamePhase.IN_PROGRESS:
-        return
-
-    game.mark_pass(user_id=user_id)
-    await broadcast_to_room(room, {
-        "type": "player_passed",
-        "user_id": user_id,
-    })
-
-    if game.is_everyone_done():
-        game.phase = GamePhase.FINISHED
-        room.is_active = False
-        await broadcast_to_room(room, {
-            "type": "game_finished",
-            # кто победил — решается отдельно, т.к. счётчики приватные
-        })
-    else:
-        game.advance_turn()
-        current = game.current_player()
-        await broadcast_to_room(room, {
-            "type": "next_turn",
-            "user_id": current.user.id if current else None,
-        })
-
-async def handle_roll_request(room: Room, user_id: str) -> None:
-    game = room.game
-    if game is None or game.phase != GamePhase.IN_PROGRESS:
-        return
-
-    current = game.current_player()
-    if current is None or current.user.id != user_id:
-        ws = room.websockets.get(user_id)
-        if ws:
-            await ws.send_text(json.dumps({"type": "error", "reason": "not_your_turn"}))
-        return
-
-    participants = [p.user.id for p in game.players]  # можно сузить до "активных", если есть статусы
-
-    async with room.round_lock:
-        if getattr(room, "current_round", None) and room.current_round.phase != "DONE":
-            return  # уже идёт раунд
-        room.current_round = RollRound(
-            id=str(uuid.uuid4()),
-            n=game.n,
-            participants=participants,
-        )
-
-    await broadcast_to_room(room, {
-        "type": "commit_phase_start",
-        "round_id": room.current_round.id,
-        "n": room.current_round.n,
-        "participants": participants,
-        "turn_user_id": user_id,
-    })
-
-
-async def handle_commit(room: Room, user_id: str, round_id: str, c: str) -> None:
-    rr: RollRound = getattr(room, "current_round", None)
-    if not rr or rr.id != round_id or rr.phase != "COMMIT":
-        return
-    if user_id not in rr.participants or not c:
-        return
-
-    rr.commits[user_id] = c
-
-    if len(rr.commits) == len(rr.participants):
-        rr.phase = "REVEAL"
-        await broadcast_to_room(room, {
-            "type": "reveal_phase_start",
-            "round_id": rr.id,
-        })
-
-
-async def handle_reveal(room: Room, user_id: str, round_id: str, a, salt: str) -> None:
-    rr: RollRound = getattr(room, "current_round", None)
-    if not rr or rr.id != round_id or rr.phase != "REVEAL":
-        return
-    if user_id not in rr.participants or salt is None:
-        return
-
-    try:
-        a_int = int(a)
-    except Exception:
-        return
-
-    # проверка диапазона a_j ∈ {0..n-1} [file:417]
-    if a_int < 0 or a_int >= rr.n:
-        return
-
-    # проверка коммитмента c_j = H(a_j || salt_j) [file:417]
-    expected = hashlib.sha256(f"{a_int}|{salt}".encode("utf-8")).hexdigest()
-    if rr.commits.get(user_id) != expected:
-        # читерство / рассинхрон: можно завершить игру или пометить игрока
-        ws = room.websockets.get(user_id)
-        if ws:
-            await ws.send_text(json.dumps({"type": "error", "reason": "commit_mismatch"}))
-        return
-
-    rr.reveals[user_id] = a_int
-
-    if len(rr.reveals) == len(rr.participants):
-        r = sum(rr.reveals.values()) % rr.n  # r = Σ a_j mod n [file:417]
-        rr.phase = "DONE"
-
-        await broadcast_to_room(room, {
-            "type": "roll_computed",
-            "round_id": rr.id,
-            "r": r,
-            "contributions": [{"user_id": uid, "a": rr.reveals[uid]} for uid in rr.participants],
-        })
-
-        # можно очистить, чтобы следующий ход мог стартовать новый раунд
-        room.current_round = None
-
