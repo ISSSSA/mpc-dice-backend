@@ -28,8 +28,18 @@ class RollRound:
     commits: Dict[str, str] = field(default_factory=dict)  # user_id -> commitment c_j
     reveals: Dict[str, int] = field(default_factory=dict)  # user_id -> revealed value a_j
     phase: str = "COMMIT"  # COMMIT -> REVEAL -> DONE
+    salts: Dict[str, str] = field(default_factory=dict)
 
-
+@dataclass
+class RoundHistory:
+    """История одного раунда для финальной верификации"""
+    round_id: str
+    player_id: str  # ID игрока, чей был ход
+    n: int
+    commits: Dict[str, str]  # user_id -> commitment
+    reveals: Dict[str, int]  # user_id -> a_value
+    salts: Dict[str, str]  # user_id -> salt
+    result: int  # вычисленное значение броска
 # ====== Domain Models ======
 
 class PlayerGameStatus(Enum):
@@ -139,7 +149,7 @@ class Room:
     game: Optional[GameState] = None
     is_active: bool = False
     websockets: Dict[str, WebSocket] = field(default_factory=dict)
-
+    rounds_history: List[RoundHistory] = field(default_factory=list)
     # MPC state
     current_round: Optional[RollRound] = None
     round_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -558,11 +568,44 @@ async def ws_room(websocket: WebSocket, room_id: str, user_id: str = Query(...))
                     room.current_round.phase = "DONE"
 
                     # Отправляем результат броска ВСЕМ игрокам
-                    await broadcast_to_room(room, {
-                        "type": "roll_computed",
-                        "round_id": round_id,
-                        "result": result
-                    })
+                    room.current_round.salts[user_id] = salt  # Сохраняем salt
+                    print(f"🔓 Reveal from {user.name}: a={a}")
+
+                    # Проверяем, все ли раскрыли значения
+                    if len(room.current_round.reveals) == len(room.current_round.participants):
+                        result = sum(room.current_round.reveals.values()) % room.current_round.n
+                        print(f"🎲 Roll result: {result}")
+                        room.current_round.phase = "DONE"
+
+                        # ✅ ИСПРАВЛЕНИЕ: Отправляем ТОЛЬКО текущему игроку
+                        game = room.game
+                        if game:
+                            current_player = game.current_player()
+                            if current_player:
+                                current_ws = room.websockets.get(current_player.user.id)
+                                if current_ws:
+                                    await current_ws.send_json({
+                                        "type": "roll_computed",
+                                        "round_id": round_id,
+                                        "result": result
+                                    })
+                                    print(f"📤 Sent result {result} ONLY to {current_player.user.name}")
+
+                        # ✅ НОВОЕ: Сохраняем историю
+                        if game and current_player:
+                            history = RoundHistory(
+                                round_id=room.current_round.id,
+                                player_id=current_player.user.id,
+                                n=room.current_round.n,
+                                commits=dict(room.current_round.commits),
+                                reveals=dict(room.current_round.reveals),
+                                salts=dict(room.current_round.salts),
+                                result=result
+                            )
+                            room.rounds_history.append(history)
+                            print(f"💾 Saved round history (total: {len(room.rounds_history)})")
+
+                        room.current_round = None
 
                     # Очищаем раунд
                     room.current_round = None
@@ -687,6 +730,84 @@ async def ws_room(websocket: WebSocket, room_id: str, user_id: str = Query(...))
                             "user_id": next_player.user.id,
                             "player_name": next_player.user.name
                         })
+            # ===== FINAL VERIFICATION REQUEST =====
+            elif msg_type == "request_final_verification":
+                game = room.game
+                if not game or game.phase != GamePhase.FINISHED:
+                    await websocket.send_json({"type": "error", "reason": "Game not finished"})
+                    continue
+
+                print(f"🔐 {user.name} requested final verification")
+                await broadcast_to_room(room, {
+                    "type": "final_verification_start",
+                    "rounds_count": len(room.rounds_history)
+                })
+
+            # ===== FINAL REVEAL =====
+            elif msg_type == "final_reveal":
+                game = room.game
+                if not game:
+                    await websocket.send_json({"type": "error", "reason": "No game"})
+                    continue
+
+                counter = data.get("counter")
+                rounds_data = data.get("rounds_data", [])
+
+                print(f"🔐 Final reveal from {user.name}: counter={counter}, rounds={len(rounds_data)}")
+
+                verified = True
+                expected_counter = 0
+                verification_errors = []
+                player_rounds = {r.get("round_id"): r for r in rounds_data}
+
+                for history in room.rounds_history:
+                    if history.player_id == user_id:
+                        player_round = player_rounds.get(history.round_id)
+
+                        if not player_round:
+                            verified = False
+                            verification_errors.append(f"Missing round {history.round_id}")
+                            continue
+
+                        a = player_round.get("a")
+                        salt = player_round.get("salt")
+
+                        expected_commit = hashlib.sha256(f"{a}|{salt}".encode("utf-8")).hexdigest()
+                        actual_commit = history.commits.get(user_id)
+
+                        if expected_commit != actual_commit:
+                            verified = False
+                            verification_errors.append(f"Commitment mismatch in round {history.round_id}")
+                            continue
+
+                        if history.reveals.get(user_id) != a:
+                            verified = False
+                            verification_errors.append(f"Reveal mismatch in round {history.round_id}")
+                            continue
+
+                        expected_counter += history.result
+
+                if expected_counter != counter:
+                    verified = False
+                    verification_errors.append(f"Counter mismatch: expected {expected_counter}, got {counter}")
+
+                if counter > game.m:
+                    verified = False
+                    verification_errors.append(f"Counter {counter} exceeds threshold {game.m}")
+
+                if verified:
+                    print(f"✅ {user.name} verification PASSED: counter={counter}")
+                else:
+                    print(f"❌ {user.name} verification FAILED: {verification_errors}")
+
+                await broadcast_to_room(room, {
+                    "type": "player_verification_result",
+                    "user_id": user_id,
+                    "player_name": user.name,
+                    "verified": verified,
+                    "counter": counter if verified else None,
+                    "errors": verification_errors if not verified else []
+                })
 
             # ===== UNKNOWN MESSAGE TYPE =====
             else:
